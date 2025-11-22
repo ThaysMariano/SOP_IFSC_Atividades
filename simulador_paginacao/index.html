@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <title>Simulador de Paginação - Parte 1</title>
+
+
+    <style>
+        body { font-family: sans-serif; display: flex; gap: 20px; }
+        .painel { padding: 15px; border: 1px solid #ccc; flex: 1; }
+        #ram-display { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; }
+        .frame { 
+            border: 1px solid #000; padding: 10px; text-align: center; 
+            height: 50px; line-height: 50px; font-weight: bold; 
+            transition: background-color 0.3s;
+        }
+        /* Cores base (a ser expandido pelo CSS completo) */
+        .frame-P1 { background-color: #f7b2b2; } /* Vermelho claro */
+        .frame-P2 { background-color: #b2f7b2; } /* Verde claro */
+        .frame-P3 { background-color: #b2b2f7; } /* Azul claro */
+        .frame-system { background-color: #cccccc; } /* Cinza (Quadro 0) */
+        .highlight { border: 3px solid yellow !important; animation: blinker 0.5s 2; }
+
+        @keyframes blinker { 50% { opacity: 0; } }
+    </style>
+
+
+</head>
+
+<body>
+
+    <div id="painel-processos" class="painel">
+        <h2>Processos e TCB</h2>
+        <div id="processos-container">
+            </div>
+    </div>
+
+    <div id="painel-mmu" class="painel">
+        <h2>MMU e Tradução de Endereços</h2>
+        <div id="mmu-log">
+            Clique em uma variável de um processo para iniciar a tradução.
+        </div>
+    </div>
+
+    <div id="painel-ram" class="painel">
+        <h2>Memória RAM (16 KiB)</h2>
+        <div id="ram-display">
+            </div>
+    </div>
+
+    <script>
+        /// --- Parâmetros Globais ---
+        const PAGE_SIZE = 1024; // 1 KiB
+        const RAM_FRAMES = 16;  // Quadros 0 a 15
+
+        // Endereços Lógicos de Exemplo para os 4KB Virtuais de cada processo:
+        // Variáveis localizadas em cada uma das 4 páginas (P0, P1, P2, P3) [cite: 23]
+        const VARIAVEIS = [
+            { nome: "VAR A (Pág 0)", endLogico: 100, pagina: 0, deslocamento: 100 },
+            { nome: "VAR B (Pág 1)", endLogico: 1100, pagina: 1, deslocamento: 76 },
+            { nome: "VAR C (Pág 2)", endLogico: 2500, pagina: 2, deslocamento: 452 },
+            { nome: "VAR D (Pág 3)", endLogico: 3500, pagina: 3, deslocamento: 428 }
+        ];
+
+        // Tabelas de Páginas (O valor é o Quadro Físico de destino) [cite: 31]
+        const PAGE_TABLES = {
+            P1: { ptbrOffset: '0x0000', table: [5, 8, 9, 11] }, // P0->Q5, P1->Q8, P2->Q9, P3->Q11
+            P2: { ptbrOffset: '0x0100', table: [1, 2, 12, 13] }, // P0->Q1, P1->Q2, P2->Q12, P3->Q13
+            P3: { ptbrOffset: '0x0200', table: [3, 4, 14, 15] }  // P0->Q3, P1->Q4, P2->Q14, P3->Q15
+        };
+
+        let processoAtivo = 'P1';
+
+
+        // --- Funções de Renderização da Interface ---
+
+        function renderProcessos() {
+            let html = '';
+            for (const proc in PAGE_TABLES) {
+                const ptInfo = PAGE_TABLES[proc];
+                html += `
+                    <div style="margin-bottom: 15px; border: 1px dashed #333; padding: 10px;">
+                        <h3>Processo: ${proc}</h3>
+                        <p>TCB: PTBR Offset = **${ptInfo.ptbrOffset}**</p>
+                        <h4>Variáveis (Endereços Lógicos):</h4>
+                        <ul>
+                            ${VARIAVEIS.map(v => 
+                                `<li>
+                                    <button onclick="mudarProcesso('${proc}'); traduzirEndereco('${proc}', ${JSON.stringify(v).replace(/"/g, "'")})">
+                                        ${v.nome} (EL: ${v.endLogico})
+                                    </button>
+                                </li>`).join('')}
+                        </ul>
+                    </div>
+                `;
+            }
+            document.getElementById('processos-container').innerHTML = html;
+        }
+
+        function renderRAM() {
+            const ramDiv = document.getElementById('ram-display');
+            let html = '';
+            for (let i = 0; i < RAM_FRAMES; i++) {
+                let cssClass = 'frame-system'; // Padrão: Quadro 0 (Tabelas) [cite: 21, 43]
+                let content = `Q ${i} (Sistema)`;
+
+                if (i !== 0) {
+                    // Mapeia o quadro ao processo (para colorir)
+                    for (const proc in PAGE_TABLES) {
+                        if (PAGE_TABLES[proc].table.includes(i)) {
+                            cssClass = `frame-${proc}`;
+                            content = `Q ${i} (${proc})`;
+                            break;
+                        }
+                    }
+                }
+                html += `<div id="frame-${i}" class="frame ${cssClass}">${content}</div>`;
+            }
+            ramDiv.innerHTML = html;
+        }
+
+        function atualizarVisualizacaoRAM(quadroFisicoAcessado, pageTable) {
+            // Remove o highlight de todos os quadros
+            document.querySelectorAll('.frame').forEach(f => f.classList.remove('highlight'));
+            
+            // Highlight para o acesso final (dado) [cite: 44]
+            const frameAcessado = document.getElementById(`frame-${quadroFisicoAcessado}`);
+            if (frameAcessado) {
+                frameAcessado.classList.add('highlight');
+            }
+
+            // O quadro 0 (tabelas) é sempre acessado primeiro [cite: 43]
+            const frame0 = document.getElementById('frame-0');
+            if (frame0) {
+                 frame0.classList.add('highlight');
+                 setTimeout(() => frame0.classList.remove('highlight'), 300); // Pisca o Quadro 0 brevemente
+            }
+        }
+
+        function mudarProcesso(proc) {
+            processoAtivo = proc;
+        }
+
+        // Inicializa o simulador ao carregar a página
+        window.onload = () => {
+            renderProcessos();
+            renderRAM();
+        };
+
+        function traduzirEndereco(processo, variavel) {
+            const endLogico = variavel.endLogico;
+            const pagLogica = variavel.pagina;
+            const deslocamento = variavel.deslocamento;
+            
+            const ptInfo = PAGE_TABLES[processo];
+            
+            // 1. Decomposição do endereço lógico [cite: 34]
+            let log = ` 🔍 Tradução do Endereço Lógico: ${endLogico}\n\n`;
+            log += `Endereço Lógico: ${endLogico}\n`;
+            log += `* Página Lógica (P): ${pagLogica} (${endLogico} / ${PAGE_SIZE})\n`;
+            log += `* Deslocamento (D): ${deslocamento} (${endLogico} % ${PAGE_SIZE})\n\n`;
+
+            // 2. Consulta à Tabela de Páginas [cite: 35]
+            // A tabela de páginas está no Quadro 0 [cite: 21]
+            const quadroFisico = ptInfo.table[pagLogica];
+            
+            log += ` ➡️ Consulta à Tabela de Páginas (Quadro 0)\n`;
+            log += `* PTBR Offset: ${ptInfo.ptbrOffset} (do TCB de ${processo})\n`;
+            log += `* Acessando Tabela: Quadro 0 + ${ptInfo.ptbrOffset} + (Pág ${pagLogica})\n`;
+            log += `* Quadro Físico (F) Encontrado: ${quadroFisico} \n\n`;
+
+            // 3. Cálculo do Endereço Físico Final [cite: 37]
+            const endFisico = quadroFisico * PAGE_SIZE + deslocamento; // Quadro x 1024 + Deslocamento [cite: 38]
+            
+            log += ` ✅ Endereço Físico Final\n`;
+            log += `* Cálculo: ${quadroFisico} * 1024 + ${deslocamento}\n`;
+            log += `* Endereço Físico: ${endFisico}\n\n`;
+            
+            // Atualiza a visualização da RAM (simula o "piscar" do quadro) [cite: 44]
+            atualizarVisualizacaoRAM(quadroFisico, ptInfo.table); 
+            
+            // Retorna o log para exibir no painel central [cite: 41]
+            document.getElementById('mmu-log').innerHTML = log.replace(/\n/g, '<br>');
+        }
+    </script>
+
+</body>
+
+</html>

@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <title>Simulador de Paginação - Parte 2: Page Fault Total</title>
+
+    <style>
+        body { font-family: sans-serif; display: flex; gap: 20px; }
+        .painel { padding: 15px; border: 1px solid #ccc; flex: 1; }
+        
+        /* RAM Vertical (Q0 no Topo) */
+        #painel-ram { display: flex; flex-direction: column; }
+        #ram-display { 
+            display: flex; 
+            flex-direction: column; 
+            gap: 2px; 
+            height: 100%;
+            border: 1px solid #333;
+            padding: 5px;
+            flex-grow: 1;
+        }
+        .frame { 
+            border: 1px solid #000; padding: 5px; text-align: center; 
+            height: 30px; line-height: 20px; font-weight: bold; 
+            transition: background-color 0.3s;
+            width: 100%;
+            box-sizing: border-box;
+            user-select: none; 
+        }
+        /* Cores dos Processos */
+        .frame-P1, .processo-P1 { background-color: #f7b2b2; }
+        .frame-P2, .processo-P2 { background-color: #b2f7f2; }
+        .frame-P3, .processo-P3 { background-color: #b2b2f7; }
+        .frame-P4, .processo-P4 { background-color: #ffcc99; }
+        .frame-system { background-color: #cccccc; }
+        .frame-kernel { background-color: #6a0dad; color: white; }
+        .frame-empty { background-color: #e0f2f7; }
+        .frame-swap { background-color: #fce4ec; border: 1px dashed #c2185b; }
+        
+        /* Destaques (Clique para Alocar) */
+        .highlight { border: 3px solid yellow !important; animation: blinker 0.5s 2; }
+        .frame-available { background-color: #00ff7f; border: 2px solid green !important; cursor: pointer !important;}
+        .frame-replaceable { background-color: #ffa07a; border: 2px solid darkorange !important; cursor: pointer !important; }
+
+        /* Estilos MMU */
+        .mmu-step { margin-top: 15px; padding: 10px; border-left: 5px solid #007bff; background-color: #f0f8ff; }
+        .mmu-output { font-size: 1.1em; font-weight: bold; color: #000080; }
+        .mmu-split {
+            font-family: monospace;
+            padding: 2px 5px;
+            border: 1px solid #333;
+            display: inline-block;
+        }
+        .mmu-split-p { color: red; font-weight: bold; border-right: 1px solid black; padding-right: 5px; }
+        .mmu-split-d { color: green; font-weight: bold; padding-left: 5px; }
+        .bit-info { margin-bottom: 5px; font-style: italic; font-size: 0.9em; }
+        
+        /* Estilos Tabela de Páginas */
+        #page-table-display { margin-top: 15px; }
+        .pt-header { display: flex; font-weight: bold; background-color: #eee; border: 1px solid #333; }
+        .pt-row { display: flex; border-top: 1px solid #ccc; }
+        .pt-cell { flex: 1; padding: 3px; text-align: center; }
+        .pt-cell-p { border-right: 1px solid #ccc; color: red; }
+        .pt-highlight { background-color: yellow; border: 2px solid orange !important; font-weight: bold; }
+    </style>
+
+</head>
+
+<body>
+
+    <div id="painel-processos" class="painel">
+        <h2>Processos e TCB</h2>
+        <div id="processos-container">
+        </div>
+    </div>
+
+    <div id="painel-mmu" class="painel">
+        <h2>MMU e Tradução de Endereços</h2>
+        <div id="page-table-display">
+        </div>
+        <div id="mmu-log">
+            Clique em uma variável de um processo para iniciar a tradução.
+        </div>
+    </div>
+
+    <div id="painel-ram" class="painel">
+        <h2>Memória RAM (Quadros 0-15)</h2>
+        <div id="ram-display">
+        </div>
+    </div>
+
+    <script>
+        // --- Global Constants and Parameters (Parte 3) ---
+        const PAGE_SIZE = 1024; 
+        const OFFSET_BITS = 10;
+        const RAM_FRAMES = 16;
+        const SWAP_FRAMES = 8;
+        const PAGE_MASK = PAGE_SIZE - 1; 
+        const USER_RAM_START = 2; // Quadros 2 a 15 são para páginas de usuário
+        const KERNEL_FRAME = 1; 
+
+        const VARIAVEIS = [
+            { nome: "VAR A (Pág 0)", endLogico: 0x0064 },
+            { nome: "VAR B (Pág 1)", endLogico: 0x044C },
+            { nome: "VAR C (Pág 2)", endLogico: 0x09C4 },
+            { nome: "VAR D (Pág 3)", endLogico: 0x0DAC }
+        ];
+
+        // Frame 0 e 1 são reservados
+        const FRAME_CONTENT = {};
+        FRAME_CONTENT['0x00'] = { proc: 'SYSTEM', page: -1, description: 'Page Tables' };
+        FRAME_CONTENT['0x01'] = { proc: 'KERNEL', page: -1, description: 'Kernel Area' };
+
+        // Estrutura da Tabela de Páginas (Status: 'P'=Presente, 'S'=Swap, 'I'=Inválida)
+        // INICIALIZAÇÃO CORRIGIDA: TODAS AS PÁGINAS INICIAM COMO 'I'NVALIDA
+        const INITIAL_PAGE_ENTRY = { frame: '0x00', status: 'I', proc: '', page: -1 };
+
+        const PAGE_TABLES = {
+            P1: { ptbrOffset: '0x0000', table: [
+                { ...INITIAL_PAGE_ENTRY, proc: 'P1', page: 0 },
+                { ...INITIAL_PAGE_ENTRY, proc: 'P1', page: 1 },
+                { ...INITIAL_PAGE_ENTRY, proc: 'P1', page: 2 },
+                { ...INITIAL_PAGE_ENTRY, proc: 'P1', page: 3 },
+            ]},
+            P2: { ptbrOffset: '0x0100', table: [
+                { ...INITIAL_PAGE_ENTRY, proc: 'P2', page: 0 },
+                { ...INITIAL_PAGE_ENTRY, proc: 'P2', page: 1 },
+                { ...INITIAL_PAGE_ENTRY, proc: 'P2', page: 2 },
+                { ...INITIAL_PAGE_ENTRY, proc: 'P2', page: 3 },
+            ]},
+            P3: { ptbrOffset: '0x0200', table: [
+                { ...INITIAL_PAGE_ENTRY, proc: 'P3', page: 0 },
+                { ...INITIAL_PAGE_ENTRY, proc: 'P3', page: 1 },
+                { ...INITIAL_PAGE_ENTRY, proc: 'P3', page: 2 },
+                { ...INITIAL_PAGE_ENTRY, proc: 'P3', page: 3 },
+            ]},
+            P4: { ptbrOffset: '0x0300', table: [
+                { ...INITIAL_PAGE_ENTRY, proc: 'P4', page: 0 },
+                { ...INITIAL_PAGE_ENTRY, proc: 'P4', page: 1 },
+                { ...INITIAL_PAGE_ENTRY, proc: 'P4', page: 2 },
+                { ...INITIAL_PAGE_ENTRY, proc: 'P4', page: 3 },
+            ]},
+        };
+        
+        let processoAtivo = 'P1';
+        let currentState = {
+            mode: 'NORMAL', 
+            proc: null,
+            pagLogicaDec: -1,
+            endLogicoDec: -1,
+        };
+
+        // --- Helper Functions ---
+        function decToHex(dec, padding = 4) {
+            return '0x' + dec.toString(16).toUpperCase().padStart(padding, '0');
+        }
+        function hexToDec(hex) {
+            return parseInt(hex, 16);
+        }
+        function getFreeSwapFrame() {
+            // Quadros de Swap: 16 (0x10) até 23 (0x17)
+            for (let i = RAM_FRAMES; i < RAM_FRAMES + SWAP_FRAMES; i++) {
+                const hex = decToHex(i, 2);
+                if (!FRAME_CONTENT[hex]) {
+                    return hex;
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Verifica se existe pelo menos um quadro livre na área de usuário (Q2-Q15).
+         * @returns {boolean} True se houver quadros livres.
+         */
+        function hasFreeUserFrame() {
+            for (let i = USER_RAM_START; i < RAM_FRAMES; i++) {
+                const iHex = decToHex(i, 2);
+                if (!FRAME_CONTENT[iHex]) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        
+        // --- Frame Selection Logic (Ação do Kernel) ---
+
+        function handleFrameSelection(frameHex) {
+            const frameDec = hexToDec(frameHex);
+            
+            if (currentState.mode !== 'PAGE_FAULT_ALLOCATE') return; 
+            
+            if (frameDec < USER_RAM_START || frameDec >= RAM_FRAMES) {
+                alert(`ERRO: O Quadro ${frameDec} é reservado (Sistema/Kernel) ou inválido para alocação de páginas de usuário.`);
+                return;
+            }
+
+            const { proc, pagLogicaDec, endLogicoDec } = currentState;
+            const ptEntry = PAGE_TABLES[proc].table[pagLogicaDec];
+            const oldContent = FRAME_CONTENT[frameHex];
+            
+            let log = '';
+
+            // NOVO: Regra de prioridade de alocação
+            if (oldContent && hasFreeUserFrame()) {
+                alert("ATENÇÃO: Você clicou em uma área OCUPADA. Ainda há Quadros Livres na Memória RAM (destacados em verde). Por favor, aloque a nova página em um quadro vazio antes de iniciar a substituição.");
+                return;
+            }
+
+            // 1. Swap Out (Se houver conteúdo antigo no quadro)
+            if (oldContent) {
+                const evictedProc = oldContent.proc;
+                const evictedPage = oldContent.page;
+                const evictedEntry = PAGE_TABLES[evictedProc].table[evictedPage];
+
+                const swapFrameHex = getFreeSwapFrame();
+                if (!swapFrameHex) {
+                    alert("ERRO: A Área de Swap está cheia! Não é possível realizar a substituição. O simulador será redefinido.");
+                    window.location.reload(); // Resetar o simulador
+                    return;
+                }
+
+                // Mover conteúdo antigo para Swap
+                FRAME_CONTENT[swapFrameHex] = oldContent;
+                delete FRAME_CONTENT[frameHex];
+
+                // Atualizar Tabela de Páginas do Processo Esvaziado (Swap Out)
+                evictedEntry.frame = swapFrameHex;
+                evictedEntry.status = 'S'; 
+                
+                log += `<div class="mmu-step" style="border-left-color: orange;"><strong>Page Replacement: Swap Out</strong></div>`;
+                log += `<div class="bit-info">O Quadro ${frameHex} estava ocupado por **${evictedProc}:${decToHex(evictedPage, 1).substring(2)}**. Esse conteúdo foi movido para o Disco (Quadro de Swap **${swapFrameHex}**). Tabela de Páginas de ${evictedProc} atualizada (Status: S).</div>`;
+
+            } else {
+                log += `<div class="mmu-step" style="border-left-color: green;"><strong>Alocação Direta</strong></div>`;
+                log += `<div class="bit-info">O Quadro ${frameHex} estava livre. Alocando a nova página diretamente.</div>`;
+            }
+
+            // 2. Swap In (Alocar a nova página)
+            if (ptEntry.status === 'S') {
+                 delete FRAME_CONTENT[ptEntry.frame]; 
+                 log += `<div class="bit-info">O Quadro de Swap **${ptEntry.frame}** é liberado (se aplicável), pois a página será movida para a RAM.</div>`;
+            }
+            
+            // Atualizar FRAME_CONTENT para a RAM
+            FRAME_CONTENT[frameHex] = { proc: proc, page: pagLogicaDec, endLogico: endLogicoDec };
+
+            // Atualizar Tabela de Páginas do Processo Ativo (Swap In)
+            ptEntry.frame = frameHex;
+            ptEntry.status = 'P'; 
+            
+            log += `<div class="mmu-step" style="border-left-color: blue;"><strong>Swap In / Alocação Concluída</strong></div>`;
+            log += `<div class="bit-info">A página **${proc}:${decToHex(pagLogicaDec, 1).substring(2)}** é alocada no Quadro Físico **${frameHex}**.</div>`;
+
+            currentState.mode = 'NORMAL';
+            traduzirEndereco(proc, endLogicoDec, pagLogicaDec, log);
+            
+            renderPageTable(proc, pagLogicaDec);
+            renderRAM(); 
+            return;
+        }
+
+        // --- Rendering Functions (Mantidas as do passo anterior) ---
+
+        function renderProcessos() {
+            let html = '';
+            for (const proc in PAGE_TABLES) {
+                const ptInfo = PAGE_TABLES[proc];
+                html += `
+                    <div style="margin-bottom: 15px; border: 1px dashed #333; padding: 10px;" class="processo-${proc}">
+                        <h3>Processo: ${proc}</h3>
+                        <p>TCB: PTBR Offset = **${ptInfo.ptbrOffset}**</p>
+                        <h4>Variáveis (Endereços Lógicos):</h4>
+                        <ul>
+                            ${VARIAVEIS.map(v => 
+                                `<li>
+                                    <button onclick="mudarProcesso('${proc}'); startTranslation('${proc}', ${v.endLogico})">
+                                        ${v.nome} (EL: <span style="font-weight: bold;">${decToHex(v.endLogico)}</span>
+                                    </button>
+                                </li>`).join('')}
+                        </ul>
+                    </div>
+                `;
+            }
+            document.getElementById('processos-container').innerHTML = html;
+        }
+
+        function renderRAM() {
+            const ramDiv = document.getElementById('ram-display');
+            let html = '';
+
+            // RAM (Quadros 0-15)
+            for (let i = 0; i < RAM_FRAMES; i++) {
+                const iHex = decToHex(i, 2);
+                const iHexShort = decToHex(i, 1).substring(2);
+                let cssClass = '';
+                let content = '';
+
+                if (i === 0) {
+                    cssClass = 'frame-system';
+                    content = `Q ${iHexShort} (Tabelas)`;
+                } else if (i === KERNEL_FRAME) {
+                    cssClass = 'frame-kernel';
+                    content = `Q ${iHexShort} (Kernel)`;
+                } else {
+                    const frameContent = FRAME_CONTENT[iHex];
+                    if (frameContent) {
+                        cssClass = `frame-${frameContent.proc}`;
+                        content = `Q ${iHexShort} (${frameContent.proc}:${decToHex(frameContent.page, 1).substring(2)})`;
+                    } else {
+                        cssClass = 'frame-empty';
+                        content = `Q ${iHexShort} (Livre)`;
+                    }
+                }
+                
+                let onClick = '';
+                if (i >= USER_RAM_START && i < RAM_FRAMES && currentState.mode === 'PAGE_FAULT_ALLOCATE') {
+                    onClick = `onclick="handleFrameSelection('${iHex}')"`;
+                    if (FRAME_CONTENT[iHex]) {
+                         cssClass += ' frame-replaceable';
+                    } else {
+                         cssClass += ' frame-available';
+                    }
+                }
+
+                html += `<div id="frame-${i}" class="frame ${cssClass}" ${onClick}>${content}</div>`;
+            }
+
+            // SWAP AREA (Quadros 16-23)
+            html += '<h4 style="margin-top: 10px;">Área de Swap (Disco)</h4>';
+            html += '<div id="swap-display" style="border: 1px solid #333; padding: 5px; display: flex; flex-direction: column;">';
+            for (let i = RAM_FRAMES; i < RAM_FRAMES + SWAP_FRAMES; i++) {
+                const iHex = decToHex(i, 2);
+                const iHexShort = decToHex(i, 1).substring(2);
+                const frameContent = FRAME_CONTENT[iHex];
+                let content = `S ${iHexShort}`;
+
+                if (frameContent) {
+                    content += ` (${frameContent.proc}:${decToHex(frameContent.page, 1).substring(2)})`;
+                } else {
+                    content += ` (Livre)`;
+                }
+                html += `<div class="frame frame-swap">${content}</div>`;
+            }
+            html += '</div>';
+
+            ramDiv.innerHTML = html;
+        }
+
+        function atualizarVisualizacaoRAM(quadroFisicoDec) {
+            document.querySelectorAll('.frame').forEach(f => f.classList.remove('highlight'));
+            
+            const frame0 = document.getElementById('frame-0');
+            if (frame0) {
+                 frame0.classList.add('highlight');
+                 setTimeout(() => frame0.classList.remove('highlight'), 300);
+            }
+            
+            const frameAcessado = document.getElementById(`frame-${quadroFisicoDec}`);
+            if (frameAcessado) {
+                setTimeout(() => frameAcessado.classList.add('highlight'), 400); 
+            }
+        }
+
+        function updateMMULog(log, title = 'MMU e Tradução de Endereços') {
+            document.getElementById('mmu-log').innerHTML = log;
+            document.querySelector('#painel-mmu h2').textContent = title;
+        }
+
+        function renderPageTable(processo, pagLogicaDec) {
+            const ptInfo = PAGE_TABLES[processo];
+            let html = `<h4>Tabela de Páginas (${processo})</h4>`;
+            
+            html += '<div style="border: 1px solid #333; margin-top: 5px;">';
+            
+            html += '<div class="pt-header">';
+            html += '<div class="pt-cell pt-cell-p" style="border-right: 1px solid #333;">Pág. Lógica (P)</div>';
+            html += '<div class="pt-cell">Quadro (F/Swap) | Status</div>';
+            html += '</div>';
+
+            ptInfo.table.forEach((entry, index) => {
+                const pagHex = decToHex(index, 1);
+                const isAccessed = (index === pagLogicaDec);
+                
+                let rowClasses = 'pt-row';
+                if (isAccessed) {
+                    rowClasses += ' pt-highlight';
+                }
+
+                html += `<div class="${rowClasses}">`;
+                html += `<div class="pt-cell pt-cell-p">${pagHex}</div>`;
+                html += `<div class="pt-cell">${entry.frame} (${entry.status})</div>`;
+                html += `</div>`;
+            });
+
+            html += '</div>';
+            document.getElementById('page-table-display').innerHTML = html;
+        }
+
+        // --- Main Translation and State Change ---
+
+        function startTranslation(proc, endLogicoDec) {
+            currentState.mode = 'NORMAL';
+            document.querySelectorAll('.frame').forEach(f => f.classList.remove('highlight'));
+            
+            const pagLogicaDec = endLogicoDec >> OFFSET_BITS;
+            const ptEntry = PAGE_TABLES[proc].table[pagLogicaDec];
+
+            renderPageTable(proc, pagLogicaDec);
+
+            if (ptEntry.status !== 'P') {
+                currentState.proc = proc;
+                currentState.pagLogicaDec = pagLogicaDec;
+                currentState.endLogicoDec = endLogicoDec;
+
+                const statusText = ptEntry.status === 'S' ? 'Ausente/Swap' : 'Inválida';
+                
+                let helpText = '';
+                if (hasFreeUserFrame()) {
+                    helpText = 'Você DEVE selecionar um Quadro Físico LIVRE (destacado em verde).';
+                } else {
+                    helpText = 'A Memória RAM está cheia. Você DEVE selecionar um quadro ocupado (destacado em laranja) para realizar o Page Replacement.';
+                }
+
+                const logFault = `<div class="mmu-step" style="border-left-color: red;"><strong>🔴 PAGE FAULT!</strong></div>
+                    <div class="bit-info">A página **${proc}:${decToHex(pagLogicaDec, 1).substring(2)}** não está na Memória RAM (Status: **${statusText}**).</div>
+                    <p style="font-weight: bold; color: red; margin-top: 10px;">
+                        O Kernel precisa intervir.<br>
+                        **Ação:** ${helpText}
+                    </p>`;
+                
+                currentState.mode = 'PAGE_FAULT_ALLOCATE';
+                updateMMULog(logFault, 'MMU - AÇÃO DO KERNEL (Page Fault)');
+                
+                renderRAM(); 
+                return;
+            }
+
+            traduzirEndereco(proc, endLogicoDec, pagLogicaDec);
+        }
+
+        function traduzirEndereco(processo, endLogicoDec, pagLogicaDec, initialLog = '') {
+            const ptEntry = PAGE_TABLES[processo].table[pagLogicaDec];
+            const endLogicoHex = decToHex(endLogicoDec, 4);
+
+            const pagLogicaHex = decToHex(pagLogicaDec, 1);
+            const deslocamentoDec = endLogicoDec & PAGE_MASK;
+            const deslocamentoHex = decToHex(deslocamentoDec, 3).substring(2);
+
+            const quadroFisicoHex = ptEntry.frame;
+            const quadroFisicoDec = hexToDec(quadroFisicoHex);
+            
+            const endFisicoDec = quadroFisicoDec * PAGE_SIZE + deslocamentoDec;
+            const endFisicoHex = decToHex(endFisicoDec, 5);
+            
+            let log = initialLog;
+            log += `<h2>Tradução MMU - Processo ${processo}</h2>`;
+
+            const endLogicoHexShort = endLogicoHex.substring(2).padStart(4, '0');
+            const P_Part = endLogicoHexShort.substring(0, endLogicoHexShort.length - 3).padStart(1, '0');
+            const D_Part = endLogicoHexShort.substring(endLogicoHexShort.length - 3);
+
+            log += `<div class="mmu-step"><strong>1. Decomposição do Endereço Lógico (EL)</strong></div>`;
+            log += `<div class="bit-info">O EL é dividido em **Página (P)** (${pagLogicaDec}), e **Deslocamento (D)** (${deslocamentoDec}).</div>`;
+            log += `<ul>`;
+            log += `<li>**EL**: <span class="mmu-output">${endLogicoHex}</span></li>`;
+            log += `<li>**P | D**: <span class="mmu-split"><span class="mmu-split-p">${P_Part}</span><span class="mmu-split-d">${D_Part}</span></span></li>`;
+            log += `</ul>`;
+
+            log += `<div class="mmu-step"><strong>2. Consulta à Tabela de Páginas (Quadro ${decToHex(0, 1)})</strong></div>`;
+            log += `<div class="bit-info">A MMU usa o índice **P** (${pagLogicaHex}) para encontrar o Quadro Físico **F** no Frame 0.</div>`;
+            log += `<ul>`;
+            log += `<li>**Resultado (Quadro Físico - F)**: <span class="mmu-output">${quadroFisicoHex}</span></li>`;
+            log += `</ul>`;
+
+            const F_Part_Final = quadroFisicoHex.substring(2).toUpperCase();
+            const D_Part_Final = deslocamentoHex;
+            
+            log += `<div class="mmu-step"><strong>3. Concatenação F | D e Geração do Endereço Físico (EF)</strong></div>`;
+            log += `<div class="bit-info">O EF é formado por **F** concatenado com **D**.</div>`;
+            log += `<ul>`;
+            log += `<li>**EF**: <span class="mmu-split"><span class="mmu-split-p" style="color: blue">${F_Part_Final}</span><span class="mmu-split-d" style="color: green">${D_Part_Final}</span></span></li>`;
+            log += `<li>**Endereço Físico (Final)**: <span class="mmu-output">${endFisicoHex}</span></li>`;
+            log += `</ul>`;
+            
+            atualizarVisualizacaoRAM(quadroFisicoDec); 
+            renderRAM();
+            
+            document.getElementById('mmu-log').innerHTML = log;
+            document.querySelector('#painel-mmu h2').textContent = 'MMU e Tradução de Endereços';
+        }
+
+
+        function mudarProcesso(proc) {
+            processoAtivo = proc;
+            currentState.mode = 'NORMAL';
+            document.getElementById('mmu-log').innerHTML = 'Clique em uma variável para traduzir o endereço.';
+            document.querySelectorAll('.frame').forEach(f => f.classList.remove('highlight'));
+            renderPageTable(proc, -1);
+            renderRAM();
+        }
+
+        window.onload = () => {
+            renderProcessos();
+            renderRAM();
+            renderPageTable(processoAtivo, -1);
+        };
+    </script>
+
+</body>
+
+</html>
